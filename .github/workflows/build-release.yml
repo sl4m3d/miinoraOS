@@ -1,0 +1,173 @@
+name: Build MiiNora Alpha and publish release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: miinora-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-and-release:
+    # Use devkitPro's maintained toolchain image. This avoids downloading
+    # apt.devkitpro.org's bootstrap script from GitHub-hosted runners.
+    # The image is pinned so builds do not silently change toolchain versions.
+    runs-on: ubuntu-24.04
+    container:
+      image: devkitpro/devkitarm:20260610
+    timeout-minutes: 40
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install small build-time utilities
+        shell: bash
+        run: |
+          set -euo pipefail
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            ca-certificates curl unzip python3 python3-pil file
+          rm -rf /var/lib/apt/lists/*
+
+      - name: Extract MiiNora source archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          ARCHIVE="miinoraOS-0.1.0-alpha-source.zip"
+          test -s "$ARCHIVE" || { echo "ERROR: $ARCHIVE not found in repository root"; ls -la; exit 1; }
+          mkdir -p "$RUNNER_TEMP/miinora-source"
+          unzip -q "$ARCHIVE" -d "$RUNNER_TEMP/miinora-source"
+          SOURCE_DIR="$RUNNER_TEMP/miinora-source/miinoraOS"
+          test -s "$SOURCE_DIR/scripts/generate-assets.py" || { echo "ERROR: generate-assets.py missing from source archive"; find "$RUNNER_TEMP/miinora-source" -maxdepth 4 -type f -print; exit 1; }
+          # Bring project files into the checkout root; preserve the active workflow.
+          cp -a "$SOURCE_DIR/." .
+          echo "MiiNora source extracted into $(pwd)"
+          test -s scripts/generate-assets.py
+          test -s installer/Makefile
+
+      - name: Verify devkitPro environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "DEVKITPRO=${DEVKITPRO:-<unset>}"
+          echo "DEVKITARM=${DEVKITARM:-<unset>}"
+          test -n "${DEVKITPRO:-}" || { echo "ERROR: DEVKITPRO is not set"; exit 1; }
+          test -n "${DEVKITARM:-}" || { echo "ERROR: DEVKITARM is not set"; exit 1; }
+          export PATH="$DEVKITARM/bin:$DEVKITPRO/tools/bin:$PATH"
+          test -x "$DEVKITARM/bin/arm-none-eabi-gcc" || { echo "ERROR: arm-none-eabi-gcc missing in $DEVKITARM/bin"; ls -la "$DEVKITARM/bin" || true; exit 1; }
+          test -x "$DEVKITARM/bin/arm-none-eabi-strip" || { echo "ERROR: arm-none-eabi-strip missing in $DEVKITARM/bin"; ls -la "$DEVKITARM/bin" || true; exit 1; }
+          test -f "$DEVKITARM/3ds_rules" || { echo "ERROR: 3ds_rules missing at $DEVKITARM/3ds_rules"; find "$DEVKITPRO" -maxdepth 4 -name 3ds_rules -print || true; exit 1; }
+          test -f "$DEVKITPRO/libctru/include/3ds.h" || { echo "ERROR: libctru header missing at $DEVKITPRO/libctru/include/3ds.h"; find "$DEVKITPRO" -maxdepth 5 -name 3ds.h -print || true; exit 1; }
+          command -v arm-none-eabi-gcc
+          command -v arm-none-eabi-strip
+          arm-none-eabi-gcc --version
+
+      - name: Download pinned CIA packaging tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/3ds-tools"
+          cd "$RUNNER_TEMP/3ds-tools"
+          curl --fail --location --retry 3 --retry-all-errors \
+            --user-agent 'MiiNora-CI/1.0' \
+            -o makerom.zip \
+            https://github.com/3DSGuy/Project_CTR/releases/download/makerom-v0.18.4/makerom-v0.18.4-ubuntu_x86_64.zip
+          curl --fail --location --retry 3 --retry-all-errors \
+            --user-agent 'MiiNora-CI/1.0' \
+            -o bannertool.zip \
+            https://github.com/Epicpkmn11/bannertool/releases/download/v1.2.2/bannertool.zip
+          mkdir makerom bannertool
+          unzip -q makerom.zip -d makerom
+          # The archive contains binaries for multiple operating systems.
+          # Select the Linux x86_64 build explicitly; never use mac-x86_64.
+          unzip -q bannertool.zip 'linux-x86_64/bannertool' -d bannertool
+          MAKEROM_BIN="$(find makerom -type f -name makerom -print -quit)"
+          BANNER_BIN="bannertool/linux-x86_64/bannertool"
+          test -n "$MAKEROM_BIN" || { echo "ERROR: Linux makerom binary not found"; find makerom -maxdepth 4 -type f -print; exit 1; }
+          test -s "$BANNER_BIN" || { echo "ERROR: Linux bannertool binary not found at $BANNER_BIN"; find bannertool -maxdepth 4 -type f -print; exit 1; }
+          chmod +x "$MAKEROM_BIN" "$BANNER_BIN"
+          echo "MAKEROM=$RUNNER_TEMP/3ds-tools/$MAKEROM_BIN" >> "$GITHUB_ENV"
+          echo "BANNERTOOL=$RUNNER_TEMP/3ds-tools/$BANNER_BIN" >> "$GITHUB_ENV"
+          file "$MAKEROM_BIN" "$BANNER_BIN"
+          # Do not call bannertool --help here: this build returns 255 for
+          # that option even though the Linux executable is valid. The real
+          # makesmdh/makebanner packaging commands below test functionality.
+
+      - name: Generate artwork
+        run: python3 scripts/generate-assets.py
+
+      - name: Build native 3DS homebrew executable
+        run: make -C installer clean all
+
+      - name: Package installable CIA
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          test -s installer/MiiNora-Installer.elf
+          test -s installer/MiiNora-Installer.3dsx
+          "$BANNERTOOL" makesmdh \
+            -s "MiiNora Installer" \
+            -l "MiiNora OS Alpha installer" \
+            -p "sl4m3d" \
+            -i installer/assets/icon.png \
+            -o dist/MiiNora.smdh
+          "$BANNERTOOL" makebanner \
+            -i installer/assets/banner.png \
+            -a installer/assets/banner.wav \
+            -o dist/MiiNora.bnr
+          arm-none-eabi-strip installer/MiiNora-Installer.elf
+          "$MAKEROM" -f cia \
+            -o dist/MiiNora-Installer.cia \
+            -target t -exefslogo \
+            -elf installer/MiiNora-Installer.elf \
+            -icon dist/MiiNora.smdh \
+            -banner dist/MiiNora.bnr \
+            -desc app:4
+          cp installer/MiiNora-Installer.3dsx dist/
+          cp README.md VERSION dist/
+          (cd "$RUNNER_TEMP/miinora-source/miinoraOS" && zip -qr "$GITHUB_WORKSPACE/dist/MiiNora-Source.zip" . -x '.github/*' '*/__pycache__/*' '*.pyc')
+          (cd dist && sha256sum \
+            MiiNora-Installer.cia \
+            MiiNora-Installer.3dsx \
+            MiiNora-Source.zip > SHA256SUMS)
+
+      - name: Verify output files
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s dist/MiiNora-Installer.cia
+          test -s dist/MiiNora-Installer.3dsx
+          test -s dist/MiiNora-Source.zip
+          test -s dist/SHA256SUMS
+          file dist/MiiNora-Installer.cia
+          cat dist/SHA256SUMS
+
+      - name: Create GitHub release and upload build artifacts
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v0.1.0-alpha.${{ github.run_number }}
+          name: "MiiNora OS 0.1 Alpha #${{ github.run_number }}"
+          prerelease: true
+          make_latest: false
+          generate_release_notes: true
+          files: |
+            dist/MiiNora-Installer.cia
+            dist/MiiNora-Installer.3dsx
+            dist/MiiNora-Source.zip
+            dist/SHA256SUMS
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload workflow build report
+        uses: actions/upload-artifact@v4
+        with:
+          name: MiiNora-Alpha-Build-${{ github.run_number }}
+          path: dist/
+          if-no-files-found: error
