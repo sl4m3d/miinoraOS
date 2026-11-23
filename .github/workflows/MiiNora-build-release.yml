@@ -1,0 +1,401 @@
+name: Build MiiNora OS
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Optional release tag (leave blank for v0.2.0-alpha)
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: miinora-build-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-os:
+    name: Build Debian armel system package
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Restore project source from uploaded archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          ARCHIVE="$(find "$GITHUB_WORKSPACE" -maxdepth 1 -type f -iname 'MiiNora-OS-*-SOURCE.zip' -print -quit)"
+          if [[ -z "$ARCHIVE" ]]; then
+            echo "ERROR: MiiNora source archive not found in repository root." >&2
+            echo "Expected: MiiNora-OS-<version>-SOURCE.zip" >&2
+            ls -lah "$GITHUB_WORKSPACE" >&2
+            exit 1
+          fi
+          echo "Using source archive: $(basename "$ARCHIVE")"
+          python3 - "$ARCHIVE" "$GITHUB_WORKSPACE" "$RUNNER_TEMP/miinora-source-extract" <<'PYTHON'
+          import pathlib, shutil, sys, zipfile
+          archive, workspace, extract = map(pathlib.Path, sys.argv[1:])
+          workspace = workspace.resolve()
+          extract.mkdir(parents=True, exist_ok=True)
+          with zipfile.ZipFile(archive) as zf:
+              for item in zf.infolist():
+                  target = (extract / item.filename).resolve()
+                  if extract.resolve() not in target.parents and target != extract.resolve():
+                      raise SystemExit(f"Unsafe path in source archive: {item.filename}")
+                  zf.extract(item, extract)
+                  # Restore executable bits: zipfile does not do this itself.
+                  unix_mode = (item.external_attr >> 16) & 0o777
+                  if unix_mode and not item.is_dir():
+                      target.chmod(unix_mode)
+          candidates = [p for p in extract.iterdir() if p.is_dir()]
+          if len(candidates) == 1:
+              source = candidates[0]
+          else:
+              source = extract
+          required = ["VERSION", "tests/validate-static.sh", "os/build-rootfs.sh",
+                      "os/scripts/package-3ds-boot-assets.sh", "installer/Makefile",
+                      "installer/source/main.c", "scripts/generate-assets.py"]
+          missing = [name for name in required if not (source / name).is_file()]
+          if missing:
+              raise SystemExit("Source archive is incomplete; missing: " + ", ".join(missing))
+          for item in source.iterdir():
+              if item.name in {".git", ".github"}:
+                  continue  # preserve the workflow currently executing
+              dest = workspace / item.name
+              if item.is_dir():
+                  if dest.exists():
+                      shutil.copytree(item, dest, dirs_exist_ok=True)
+                  else:
+                      shutil.copytree(item, dest)
+              else:
+                  shutil.copy2(item, dest)
+          print(f"Restored MiiNora source from {archive.name}")
+          PYTHON
+          chmod +x "$GITHUB_WORKSPACE/tests/validate-static.sh" \
+            "$GITHUB_WORKSPACE/os/build-rootfs.sh" \
+            "$GITHUB_WORKSPACE/os/scripts/package-3ds-boot-assets.sh" \
+            "$GITHUB_WORKSPACE/os/install-on-linux-host.sh"
+          test -s "$GITHUB_WORKSPACE/os/build-rootfs.sh"
+          test -s "$GITHUB_WORKSPACE/installer/source/main.c"
+
+      - name: Install rootfs build dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            debootstrap qemu-user-static binfmt-support curl ca-certificates \
+            file python3 python3-pil tar gzip coreutils findutils binutils
+          sudo update-binfmts --enable qemu-arm || true
+
+      - name: Run source static validation
+        run: bash ./tests/validate-static.sh
+
+      - name: Build minimal Debian Bookworm armel root filesystem
+        run: sudo bash ./os/build-rootfs.sh "$RUNNER_TEMP/miinora-rootfs"
+
+      - name: Package upstream Nintendo 3DS boot components and modules
+        run: ./os/scripts/package-3ds-boot-assets.sh "$RUNNER_TEMP/miinora-os-package"
+
+      - name: Assemble and validate OS release package
+        shell: bash
+        run: |
+          set -euo pipefail
+          ROOTFS="$RUNNER_TEMP/miinora-rootfs/MiiNora-Debian-Bookworm-armel-rootfs.tar.gz"
+          PACKAGE="$RUNNER_TEMP/miinora-os-package"
+          test -s "$ROOTFS"
+          install -D -m 0644 "$ROOTFS" "$PACKAGE/rootfs/MiiNora-Debian-Bookworm-armel-rootfs.tar.gz"
+          cp VERSION "$PACKAGE/VERSION"
+          cat > "$PACKAGE/manifest.json" <<'JSON'
+          {
+            "name": "MiiNora OS",
+            "version": "0.2.0-alpha",
+            "target": "Nintendo 3DS Old model (CTR)",
+            "userspace": "Debian Bookworm armel",
+            "kernel_source": "Upstream 3DS-Linux SD files",
+            "kernel_modules": "Matching upstream 3DS-Linux modules archive",
+            "bootloader": "FIRM Linux Loader for Luma3DS",
+            "root_filesystem": "ext4",
+            "installer_note": "The CIA can download the package to FAT32; extract the rootfs to the prepared ext4 partition with os/install-on-linux-host.sh."
+          }
+          JSON
+          test -s "$PACKAGE/fat32/linux/zImage"
+          test -s "$PACKAGE/fat32/linux/nintendo3ds_ctr.dtb"
+          test -s "$PACKAGE/fat32/linux/arm9linuxfw.bin"
+          test -s "$PACKAGE/fat32/luma/payloads/firm_linux_loader.firm"
+          test -s "$PACKAGE/modules/3ds-modules.tar"
+          tar -tf "$PACKAGE/modules/3ds-modules.tar" | grep -Eq '^lib/modules/.+\.ko(\.xz|\.gz)?$'
+          ! find "$PACKAGE/fat32" -type l -print -quit | grep -q .
+          ! find "$PACKAGE/fat32" -type f -name boot.firm -print -quit | grep -q .
+          test "$(stat -c %s "$PACKAGE/fat32/linux/zImage")" -gt 524288
+          test "$(stat -c %s "$PACKAGE/fat32/linux/nintendo3ds_ctr.dtb")" -gt 4096
+          test "$(stat -c %s "$PACKAGE/fat32/linux/arm9linuxfw.bin")" -gt 4096
+          test "$(stat -c %s "$PACKAGE/fat32/luma/payloads/firm_linux_loader.firm")" -gt 4096
+          ROOTFS_TMP="$RUNNER_TEMP/rootfs-check"
+          mkdir -p "$ROOTFS_TMP"
+          tar -xzf "$ROOTFS" -C "$ROOTFS_TMP" ./usr/bin/dash
+          readelf -h "$ROOTFS_TMP/usr/bin/dash" | grep -q 'Machine:.*ARM'
+          rm -rf "$ROOTFS_TMP"
+          mkdir -p dist
+          tar --sort=name --mtime='UTC 2024-01-01' --owner=0 --group=0 --numeric-owner \
+            -C "$PACKAGE" -czf dist/MiiNora-OS-Package.tar.gz .
+          test "$(stat -c %s dist/MiiNora-OS-Package.tar.gz)" -gt 10485760
+          sha256sum dist/MiiNora-OS-Package.tar.gz > dist/MiiNora-OS-Package.tar.gz.sha256
+          file dist/MiiNora-OS-Package.tar.gz
+          du -h dist/MiiNora-OS-Package.tar.gz
+
+      - name: Upload OS package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: miinora-os-package
+          path: |
+            dist/MiiNora-OS-Package.tar.gz
+            dist/MiiNora-OS-Package.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 14
+
+  build-installer:
+    name: Build native 3DS CIA and 3DSX
+    runs-on: ubuntu-24.04
+    container:
+      image: devkitpro/devkitarm:20260610
+    timeout-minutes: 40
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Restore project source from uploaded archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          ARCHIVE="$(find "$GITHUB_WORKSPACE" -maxdepth 1 -type f -iname 'MiiNora-OS-*-SOURCE.zip' -print -quit)"
+          if [[ -z "$ARCHIVE" ]]; then
+            echo "ERROR: MiiNora source archive not found in repository root." >&2
+            echo "Expected: MiiNora-OS-<version>-SOURCE.zip" >&2
+            ls -lah "$GITHUB_WORKSPACE" >&2
+            exit 1
+          fi
+          echo "Using source archive: $(basename "$ARCHIVE")"
+          python3 - "$ARCHIVE" "$GITHUB_WORKSPACE" "$RUNNER_TEMP/miinora-source-extract" <<'PYTHON'
+          import pathlib, shutil, sys, zipfile
+          archive, workspace, extract = map(pathlib.Path, sys.argv[1:])
+          workspace = workspace.resolve()
+          extract.mkdir(parents=True, exist_ok=True)
+          with zipfile.ZipFile(archive) as zf:
+              for item in zf.infolist():
+                  target = (extract / item.filename).resolve()
+                  if extract.resolve() not in target.parents and target != extract.resolve():
+                      raise SystemExit(f"Unsafe path in source archive: {item.filename}")
+                  zf.extract(item, extract)
+                  # Restore executable bits: zipfile does not do this itself.
+                  unix_mode = (item.external_attr >> 16) & 0o777
+                  if unix_mode and not item.is_dir():
+                      target.chmod(unix_mode)
+          candidates = [p for p in extract.iterdir() if p.is_dir()]
+          if len(candidates) == 1:
+              source = candidates[0]
+          else:
+              source = extract
+          required = ["VERSION", "tests/validate-static.sh", "os/build-rootfs.sh",
+                      "os/scripts/package-3ds-boot-assets.sh", "installer/Makefile",
+                      "installer/source/main.c", "scripts/generate-assets.py"]
+          missing = [name for name in required if not (source / name).is_file()]
+          if missing:
+              raise SystemExit("Source archive is incomplete; missing: " + ", ".join(missing))
+          for item in source.iterdir():
+              if item.name in {".git", ".github"}:
+                  continue  # preserve the workflow currently executing
+              dest = workspace / item.name
+              if item.is_dir():
+                  if dest.exists():
+                      shutil.copytree(item, dest, dirs_exist_ok=True)
+                  else:
+                      shutil.copytree(item, dest)
+              else:
+                  shutil.copy2(item, dest)
+          print(f"Restored MiiNora source from {archive.name}")
+          PYTHON
+          chmod +x "$GITHUB_WORKSPACE/tests/validate-static.sh" \
+            "$GITHUB_WORKSPACE/os/build-rootfs.sh" \
+            "$GITHUB_WORKSPACE/os/scripts/package-3ds-boot-assets.sh" \
+            "$GITHUB_WORKSPACE/os/install-on-linux-host.sh"
+          test -s "$GITHUB_WORKSPACE/os/build-rootfs.sh"
+          test -s "$GITHUB_WORKSPACE/installer/source/main.c"
+
+      - name: Install Python image dependency for static validation
+        shell: bash
+        run: |
+          set -euo pipefail
+          apt-get update
+          apt-get install -y --no-install-recommends python3 python3-pil
+
+      - name: Run source static validation
+        run: bash ./tests/validate-static.sh
+
+      - name: Install build utilities and verify devkitARM tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          apt-get update
+          apt-get install -y --no-install-recommends ca-certificates curl unzip zip file
+          apt-get install -y --no-install-recommends binutils-arm-none-eabi || true
+          test -n "${DEVKITPRO:-}"
+          test -n "${DEVKITARM:-}"
+          echo "$DEVKITARM/bin" >> "$GITHUB_PATH"
+          echo "$DEVKITPRO/tools/bin" >> "$GITHUB_PATH"
+          STRIP="$DEVKITARM/bin/arm-none-eabi-strip"
+          if [[ ! -x "$STRIP" ]]; then STRIP="$(command -v arm-none-eabi-strip || true)"; fi
+          if [[ -z "$STRIP" || ! -x "$STRIP" ]]; then
+            echo "ERROR: arm-none-eabi-strip is missing. Refusing to package an incomplete installer." >&2
+            find "$DEVKITPRO" -maxdepth 5 -name 'arm-none-eabi-strip' -print || true
+            exit 1
+          fi
+          echo "ARM_STRIP=$STRIP" >> "$GITHUB_ENV"
+          test -f "$DEVKITARM/3ds_rules"
+          test -f "$DEVKITPRO/libctru/include/3ds.h"
+          "$DEVKITARM/bin/arm-none-eabi-gcc" --version
+          "$STRIP" --version
+
+      - name: Run source static validation
+        run: bash ./tests/validate-static.sh
+
+      - name: Generate custom MiiNora branding assets
+        run: python3 scripts/generate-assets.py
+
+      - name: Build native installer
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag != '' && inputs.release_tag || format('v0.2.0-alpha.{0}', github.run_number) }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PYCODE'
+          import os, re
+          from pathlib import Path
+          tag = os.environ["RELEASE_TAG"]
+          if not re.fullmatch(r"[A-Za-z0-9._-]{1,80}", tag):
+              raise SystemExit("Invalid release tag")
+          source = Path("installer/source/main.c")
+          text = source.read_text()
+          text = re.sub(r'#define PACKAGE_URL "[^"]+"',
+                        f'#define PACKAGE_URL "https://github.com/sl4m3d/miinoraOS/releases/download/{tag}/MiiNora-OS-Package.tar.gz"',
+                        text, count=1)
+          source.write_text(text)
+          PYCODE
+          make -C installer clean all
+          test -s installer/MiiNora-Installer.elf
+          test -s installer/MiiNora-Installer.3dsx
+
+      - name: Download CIA packaging tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/3ds-tools"
+          cd "$RUNNER_TEMP/3ds-tools"
+          curl --fail --location --retry 4 --retry-all-errors \
+            -o makerom.zip \
+            https://github.com/3DSGuy/Project_CTR/releases/download/makerom-v0.18.4/makerom-v0.18.4-ubuntu_x86_64.zip
+          curl --fail --location --retry 4 --retry-all-errors \
+            -o bannertool.zip \
+            https://github.com/Epicpkmn11/bannertool/releases/download/v1.2.2/bannertool.zip
+          mkdir makerom bannertool
+          unzip -q makerom.zip -d makerom
+          unzip -q bannertool.zip 'linux-x86_64/bannertool' -d bannertool
+          MAKEROM_BIN="$(find makerom -type f -name makerom -print -quit)"
+          BANNER_BIN="bannertool/linux-x86_64/bannertool"
+          test -n "$MAKEROM_BIN"
+          test -s "$BANNER_BIN"
+          chmod +x "$MAKEROM_BIN" "$BANNER_BIN"
+          echo "MAKEROM=$RUNNER_TEMP/3ds-tools/$MAKEROM_BIN" >> "$GITHUB_ENV"
+          echo "BANNERTOOL=$RUNNER_TEMP/3ds-tools/$BANNER_BIN" >> "$GITHUB_ENV"
+
+      - name: Package CIA and 3DSX
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          "$BANNERTOOL" makesmdh -s "MiiNora Installer" -l "MiiNora OS setup utility" -p "sl4m3d" -i installer/assets/icon.png -o dist/MiiNora.smdh
+          "$BANNERTOOL" makebanner -i installer/assets/banner.png -a installer/assets/banner.wav -o dist/MiiNora.bnr
+          "$ARM_STRIP" installer/MiiNora-Installer.elf
+          "$MAKEROM" -f cia -o dist/MiiNora-Installer.cia -target t -exefslogo \
+            -elf installer/MiiNora-Installer.elf -icon dist/MiiNora.smdh -banner dist/MiiNora.bnr -desc app:4
+          cp installer/MiiNora-Installer.3dsx dist/
+          cp README.md VERSION dist/
+          (cd "$GITHUB_WORKSPACE" && zip -qr "$GITHUB_WORKSPACE/dist/MiiNora-Source.zip" . \
+            -x '.git/*' 'dist/*' '*/__pycache__/*' '*.pyc')
+          test -s dist/MiiNora-Installer.cia
+          test -s dist/MiiNora-Installer.3dsx
+          test -s dist/MiiNora-Source.zip
+          file dist/MiiNora-Installer.cia dist/MiiNora-Installer.3dsx
+
+      - name: Upload installer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: miinora-installer
+          path: |
+            dist/MiiNora-Installer.cia
+            dist/MiiNora-Installer.3dsx
+            dist/MiiNora-Source.zip
+          if-no-files-found: error
+          retention-days: 14
+
+  publish-release:
+    name: Publish complete MiiNora release
+    runs-on: ubuntu-24.04
+    needs: [build-os, build-installer]
+    steps:
+      - name: Download OS package
+        uses: actions/download-artifact@v4
+        with:
+          name: miinora-os-package
+          path: release/os
+
+      - name: Download installer files
+        uses: actions/download-artifact@v4
+        with:
+          name: miinora-installer
+          path: release/installer
+
+      - name: Assemble checksums and verify release contents
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp release/os/* dist/
+          cp release/installer/* dist/
+          test -s dist/MiiNora-OS-Package.tar.gz
+          test -s dist/MiiNora-Installer.cia
+          test -s dist/MiiNora-Installer.3dsx
+          test -s dist/MiiNora-Source.zip
+          (cd dist && sha256sum MiiNora-OS-Package.tar.gz MiiNora-Installer.cia MiiNora-Installer.3dsx MiiNora-Source.zip > SHA256SUMS)
+          cat dist/SHA256SUMS
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.release_tag != '' && inputs.release_tag || format('v0.2.0-alpha.{0}', github.run_number) }}
+          name: MiiNora OS ${{ inputs.release_tag != '' && inputs.release_tag || format('v0.2.0-alpha.{0}', github.run_number) }}
+          prerelease: true
+          make_latest: false
+          overwrite_files: true
+          generate_release_notes: true
+          files: |
+            dist/MiiNora-Installer.cia
+            dist/MiiNora-Installer.3dsx
+            dist/MiiNora-OS-Package.tar.gz
+            dist/MiiNora-OS-Package.tar.gz.sha256
+            dist/MiiNora-Source.zip
+            dist/SHA256SUMS
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload full release bundle for CI inspection
+        uses: actions/upload-artifact@v4
+        with:
+          name: MiiNora-Release-Bundle
+          path: dist/
+          if-no-files-found: error
+          retention-days: 30
