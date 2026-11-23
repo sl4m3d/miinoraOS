@@ -1,0 +1,556 @@
+name: Build MiiNora and assemble Old 3DS OS package
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Release tag to publish, for example v0.1.1-alpha"
+        required: true
+        type: string
+        default: "v0.1.1-alpha"
+
+permissions:
+  contents: write
+
+
+concurrency:
+  group: miinora-build-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-24.04
+    container:
+      image: devkitpro/devkitarm:20260610
+    timeout-minutes: 120
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install build and packaging utilities
+        shell: bash
+        run: |
+          set -euo pipefail
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            ca-certificates curl unzip zip python3 python3-pil file tar gzip
+          rm -rf /var/lib/apt/lists/*
+
+      - name: Validate release version and prepare source
+        id: version
+        shell: bash
+        env:
+          REQUESTED_RELEASE_TAG: ${{ github.event.inputs.release_tag }}
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
+            RELEASE_TAG="$REQUESTED_RELEASE_TAG"
+            if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+              echo "ERROR: invalid release tag '$RELEASE_TAG'. Expected e.g. v0.1.1-alpha." >&2
+              exit 1
+            fi
+          else
+            RELEASE_TAG="v0.1.0-alpha.${GITHUB_RUN_NUMBER}"
+          fi
+          APP_VERSION="${RELEASE_TAG#v}"
+          echo "tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+          echo "app_version=$APP_VERSION" >> "$GITHUB_OUTPUT"
+          echo "MIINORA_VERSION=$APP_VERSION" >> "$GITHUB_ENV"
+
+          ARCHIVE="miinoraOS-0.1.0-alpha-source.zip"
+          test -s "$ARCHIVE" || { echo "ERROR: $ARCHIVE not found in repository root"; ls -la; exit 1; }
+          mkdir -p "$RUNNER_TEMP/miinora-source"
+          unzip -q "$ARCHIVE" -d "$RUNNER_TEMP/miinora-source"
+          SOURCE_DIR="$RUNNER_TEMP/miinora-source/miinoraOS"
+          test -s "$SOURCE_DIR/scripts/generate-assets.py" || {
+            echo "ERROR: generate-assets.py missing from source archive"
+            find "$RUNNER_TEMP/miinora-source" -maxdepth 4 -type f -print
+            exit 1
+          }
+
+          python3 - "$SOURCE_DIR" "$APP_VERSION" <<'PY'
+          #!/usr/bin/env python3
+          """Apply strict, reproducible fixes to the archived MiiNora companion source."""
+          from __future__ import annotations
+          
+          import re
+          import sys
+          from pathlib import Path
+          
+          
+          def replace_once(source: str, old: str, new: str, label: str) -> str:
+              count = source.count(old)
+              if count != 1:
+                  raise SystemExit(f"Patch precondition failed for {label}: expected 1 match, found {count}")
+              return source.replace(old, new, 1)
+          
+          
+          def main() -> None:
+              if len(sys.argv) != 3:
+                  raise SystemExit("Usage: patch-source.py <source-root> <app-version>")
+          
+              root = Path(sys.argv[1]).resolve()
+              version = sys.argv[2]
+              if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?", version):
+                  raise SystemExit(f"Invalid app version: {version!r}")
+          
+              source_path = root / "installer/source/main.c"
+              source = source_path.read_text(encoding="utf-8")
+          
+              patches = [
+                  (
+                      '#define APP_VERSION "0.1.0-alpha"',
+                      '#ifndef MIINORA_VERSION\n#define MIINORA_VERSION "0.1.0-alpha"\n#endif\n#define APP_VERSION MIINORA_VERSION',
+                      "version macro",
+                  ),
+                  (
+                      '#define DOWNLOAD_TEMP DOWNLOAD_DIR "/miinoraOS-main.zip.part"\n#define MAX_DOWNLOAD_SIZE (16u * 1024u * 1024u)',
+                      '#define DOWNLOAD_TEMP DOWNLOAD_DIR "/miinoraOS-main.zip.part"\n#define DOWNLOAD_BACKUP DOWNLOAD_FILE ".bak"\n#define MAX_DOWNLOAD_SIZE (4u * 1024u * 1024u)',
+                      "download limits and backup path",
+                  ),
+                  (
+                      '    printf("OLD 3DS / CTR  |  Installer & system shell\\n");',
+                      '    printf("OLD 3DS / CTR  |  Homebrew companion app\\n");',
+                      "app identity",
+                  ),
+                  (
+                      '        printf("A lightweight starting point for the\\n");\n        printf("MiiNora Linux project.\\n\\n");\n        printf("The CIA is a native 3DS installer app.\\n");\n        printf("It is not the Debian operating system.\\n\\n");',
+                      '        printf("MiiNora Linux for the original 3DS.\\n\\n");\n        printf("This CIA is a companion homebrew app.\\n");\n        printf("It does not install or boot Linux.\\n\\n");',
+                      "home screen scope",
+                  ),
+                  (
+                      '        printf("Alpha scope: native installer UI and\\n");\n        printf("repository snapshot downloader.\\n\\n");\n        printf("Debian root filesystem, Linux boot,\\n");\n        printf("display/touch drivers and apps are not\\n");\n        printf("yet a verified bootable OS release.\\n");',
+                      '        printf("Companion app: menu and source downloader.\\n\\n");\n        printf("The Linux system is distributed separately\\n");\n        printf("as an Old 3DS system bundle.\\n\\n");\n        printf("This CIA does not repartition the SD card,\\n");\n        printf("install Linux or modify system firmware.\\n");',
+                      "about screen scope",
+                  ),
+                  (
+                      '    printf("[ HOME ] [ APPS ] [ SYSTEM ]\\n\\n");',
+                      '        printf("Page: %s\\n\\n", currentPage == PAGE_HOME ? "Home" :\n               currentPage == PAGE_SETTINGS ? "Settings" :\n               currentPage == PAGE_ABOUT ? "About" :\n               currentPage == PAGE_FILES ? "Files" :\n               currentPage == PAGE_DOWNLOAD ? "Download" :\n               currentPage == PAGE_DOWNLOAD_RESULT ? "Download result" : "Browser preview");',
+                      "remove inert bottom navigation",
+                  ),
+                  (
+                      '        printf("%c Dark interface\\n", selectedItem == 0 ? \'>\' : \' \');',
+                      '        printf("%c Confirm downloads\\n", selectedItem == 0 ? \'>\' : \' \');',
+                      "settings label",
+                  ),
+                  (
+                      '    int outcome = -1;\n',
+                      '    int outcome = -1;\n    int hadExistingFile = 0;\n',
+                      "download backup state",
+                  ),
+                  (
+                      '    httpcAddRequestHeaderField(&context, "User-Agent", "MiiNora-Installer/0.1.0-alpha");\n    httpcAddRequestHeaderField(&context, "Accept", "application/zip");',
+                      '    result = httpcAddRequestHeaderField(&context, "User-Agent", "MiiNora-Companion/" APP_VERSION);\n    if (R_FAILED(result)) {\n        snprintf(statusText, sizeof(statusText), "Could not set HTTP User-Agent (0x%08lX).", (unsigned long)result);\n        goto cleanup;\n    }\n    result = httpcAddRequestHeaderField(&context, "Accept", "application/zip");\n    if (R_FAILED(result)) {\n        snprintf(statusText, sizeof(statusText), "Could not set HTTP Accept header (0x%08lX).", (unsigned long)result);\n        goto cleanup;\n    }',
+                      "HTTP request header error handling",
+                  ),
+                  (
+                      '    httpcAddDefaultCert(&context, SSLC_DefaultRootCert_DigiCert_EV);\n    httpcAddDefaultCert(&context, SSLC_DefaultRootCert_USERTrust);\n    httpcAddDefaultCert(&context, SSLC_DefaultRootCert_COMODO);\n    httpcAddDefaultCert(&context, SSLC_DefaultRootCert_CyberTrust);\n',
+                      '    int trustedRootsAdded = 0;\n    if (R_SUCCEEDED(httpcAddDefaultCert(&context, SSLC_DefaultRootCert_DigiCert_EV))) trustedRootsAdded++;\n    if (R_SUCCEEDED(httpcAddDefaultCert(&context, SSLC_DefaultRootCert_USERTrust))) trustedRootsAdded++;\n    if (R_SUCCEEDED(httpcAddDefaultCert(&context, SSLC_DefaultRootCert_COMODO))) trustedRootsAdded++;\n    if (R_SUCCEEDED(httpcAddDefaultCert(&context, SSLC_DefaultRootCert_CyberTrust))) trustedRootsAdded++;\n    if (trustedRootsAdded == 0) {\n        snprintf(statusText, sizeof(statusText), "No supported HTTPS root certificate could be enabled.");\n        goto cleanup;\n    }\n',
+                      "HTTPS certificate setup checks",
+                  ),
+                  (
+                      '    result = httpcGetResponseStatusCodeTimeout(&context, &responseCode, 30000000000ULL);\n    if (R_FAILED(result) || responseCode != 200) {\n        snprintf(statusText, sizeof(statusText), "GitHub returned HTTP %lu.", (unsigned long)responseCode);\n        goto cleanup;\n    }\n',
+                      '    result = httpcGetResponseStatusCodeTimeout(&context, &responseCode, 30000000000ULL);\n    if (R_FAILED(result)) {\n        snprintf(statusText, sizeof(statusText), "Could not read HTTP response (0x%08lX).", (unsigned long)result);\n        goto cleanup;\n    }\n    if (responseCode != 200) {\n        snprintf(statusText, sizeof(statusText), "GitHub returned HTTP %lu.", (unsigned long)responseCode);\n        goto cleanup;\n    }\n',
+                      "HTTP response error reporting",
+                  ),
+                  (
+                      '    size_t written = fwrite(buffer, 1, downloaded, file);\n    fclose(file);\n    file = NULL;\n    if (written != downloaded) {\n        remove(DOWNLOAD_TEMP);\n        snprintf(statusText, sizeof(statusText), "SD-card write failed.");\n        goto cleanup;\n    }\n    remove(DOWNLOAD_FILE);\n    if (rename(DOWNLOAD_TEMP, DOWNLOAD_FILE) != 0) {\n        remove(DOWNLOAD_TEMP);\n        snprintf(statusText, sizeof(statusText), "Could not finalize the ZIP on the SD card.");\n        goto cleanup;\n    }\n',
+                      '    size_t written = fwrite(buffer, 1, downloaded, file);\n    int flushResult = fflush(file);\n    int closeResult = fclose(file);\n    file = NULL;\n    if (written != downloaded || flushResult != 0 || closeResult != 0) {\n        remove(DOWNLOAD_TEMP);\n        snprintf(statusText, sizeof(statusText), "SD-card write or flush failed.");\n        goto cleanup;\n    }\n\n    struct stat existingFile;\n    hadExistingFile = (stat(DOWNLOAD_FILE, &existingFile) == 0);\n    remove(DOWNLOAD_BACKUP);\n    if (hadExistingFile && rename(DOWNLOAD_FILE, DOWNLOAD_BACKUP) != 0) {\n        remove(DOWNLOAD_TEMP);\n        snprintf(statusText, sizeof(statusText), "Could not protect the previous ZIP before updating.");\n        goto cleanup;\n    }\n    if (rename(DOWNLOAD_TEMP, DOWNLOAD_FILE) != 0) {\n        if (hadExistingFile) rename(DOWNLOAD_BACKUP, DOWNLOAD_FILE);\n        remove(DOWNLOAD_TEMP);\n        snprintf(statusText, sizeof(statusText), "Could not finalize the ZIP on the SD card.");\n        goto cleanup;\n    }\n    if (hadExistingFile) remove(DOWNLOAD_BACKUP);\n',
+                      "atomic source archive replacement",
+                  ),
+                  (
+                      '    if (file) fclose(file);\n    if (buffer) free(buffer);\n',
+                      '    if (file) fclose(file);\n    if (outcome != 0) remove(DOWNLOAD_TEMP);\n    if (buffer) free(buffer);\n',
+                      "failed download temporary-file cleanup",
+                  ),
+                  (
+                      '        if (stat(DOWNLOAD_FILE, &downloadedArchive) == 0 && downloadedArchive.st_size > 0) {\n            snprintf(statusText, sizeof(statusText), "Source snapshot already exists on SD card.");\n        } else {\n            currentPage = PAGE_DOWNLOAD;\n            downloadResult = downloadRepository();\n            currentPage = PAGE_DOWNLOAD_RESULT;\n        }\n',
+                      '        if (stat(DOWNLOAD_FILE, &downloadedArchive) == 0 && downloadedArchive.st_size > 0) {\n            snprintf(statusText, sizeof(statusText), "Source snapshot already exists on SD card.");\n        } else {\n            snprintf(statusText, sizeof(statusText), "No source snapshot yet. Select Download repository.");\n        }\n',
+                      "no unsolicited first-launch download",
+                  ),
+                  (
+                      '            if (kDown & KEY_TOUCH) {\n                selectedItem = (touch.py < 120) ? 0 : 1;\n                if (selectedItem == 0) confirmDownloads = !confirmDownloads;\n                else showTouchHints = !showTouchHints;\n            }\n',
+                      '            if (kDown & KEY_TOUCH) {\n                if (touch.py >= 24 && touch.py < 32) {\n                    selectedItem = 0;\n                    confirmDownloads = !confirmDownloads;\n                } else if (touch.py >= 32 && touch.py < 40) {\n                    selectedItem = 1;\n                    showTouchHints = !showTouchHints;\n                }\n            }\n',
+                      "settings touch hit targets",
+                  ),
+              ]
+          
+              for old, new, label in patches:
+                  source = replace_once(source, old, new, label)
+          
+              version_line = f'#define MIINORA_VERSION "{version}"'
+              source, count = re.subn(r'(?m)^#define MIINORA_VERSION "[^"]*"$', version_line, source, count=1)
+              if count != 1:
+                  raise SystemExit("Patch precondition failed for setting the release version")
+          
+              source_path.write_text(source, encoding="utf-8")
+              print(f"Patched {source_path} for MiiNora {version}; {len(patches) + 1} checked changes applied.")
+          
+          
+          if __name__ == "__main__":
+              main()
+          PY
+          printf '%s\n' "$APP_VERSION" > "$SOURCE_DIR/VERSION"
+          cat > "$SOURCE_DIR/README.md" <<'MD'
+          # MiiNora OS
+          
+          **MiiNora OS for the original Nintendo 3DS (CTR)**
+          
+          MiiNora contains two separate deliverables:
+          
+          - `MiiNora-Installer.cia`: a small native Homebrew companion app for the HOME Menu. It provides a basic menu and can download the MiiNora source snapshot. It does **not** install Linux, repartition an SD card, flash firmware, or replace the console's operating system.
+          - `MiiNora-OS-Old3DS.tar`: the complete Old-3DS Linux system bundle, assembled from the currently published 3DS-Linux root filesystem and SD-card boot files. The base userspace is **Void Linux**, not Debian.
+          
+          ## What is included in the system bundle
+          
+          The system package contains the official 3DS-Linux `rootfs.tar.gz` and `sd_files.tar.gz` assets, an upstream/source manifest, installation notes, and checksums. The official root filesystem is larger than 500 MB when unpacked; the installer CIA is intentionally much smaller because it is only a companion app.
+          
+          The build does not recompile the upstream Linux kernel or firmware loader. It packages the official 3DS-Linux bootable assets that are published for the Old 3DS, rather than replacing a known-working kernel/boot flow with an untested custom one.
+          
+          ## Compatibility and limitations
+          
+          The upstream 3DS-Linux project documents booting on the original 3DS and support for SD storage, the top-screen framebuffer, bottom-screen virtual keyboard, buttons, Circle Pad, battery reporting, and the Atheros AR6014 Wi-Fi adapter. Sound is not supported. Powering off from Linux can cause a kernel panic. Linux must be booted through the supported Luma3DS/FIRM path; it cannot be launched as a normal CIA after Horizon OS has taken control.
+          
+          Wi-Fi firmware is not included in the release because the upstream project does not redistribute the console-specific firmware. Follow the official upstream guide for that separate step.
+          
+          ## Installation
+          
+          Installation is currently manual and requires a Linux computer. Read the official [3DS-Linux installation guide](https://3dslinux.org/installguide/) in full before changing an SD card. The upstream layout uses a FAT32 boot partition and an EXT4 root-filesystem partition. The rootfs needs more than 500 MB unpacked; the upstream guide recommends at least 1 GB and 4 GB or more for comfortable use.
+          
+          Back up the entire SD card first. Do not format an existing partition unless you deliberately intend to erase it. MiiNora's build and companion CIA do not format, repartition, or write to a console's SD card.
+          
+          ## Build and releases
+          
+          Pushing to `main` runs CI and creates a downloadable Actions build artifact. Publishing a GitHub prerelease is a separate manual action: choose **Actions → Build MiiNora Alpha and publish release → Run workflow**, enter a release tag such as `v0.1.1-alpha`, and start the run. The release contains the CIA, 3DSX, source snapshot, full Old-3DS system bundle, and SHA-256 checksums.
+          
+          ## Upstream projects
+          
+          - [3DS-Linux project and compatibility notes](https://3dslinux.org/)
+          - [Official downloads](https://3dslinux.org/downloads/)
+          - [Installation guide](https://3dslinux.org/installguide/)
+          - [Kernel source](https://github.com/Peugeot205GTI/linux-3DS)
+          - [FIRM Linux Loader source](https://github.com/Peugeot205GTI/firm_linux_loader)
+          - [ARM9 firmware source](https://github.com/Peugeot205GTI/arm9linuxfw)
+          
+          The system components retain their respective upstream licenses and attribution. MiiNora's companion-app source remains under the repository's MIT license.
+          MD
+          cat > "$SOURCE_DIR/os/README.md" <<'MD'
+          # MiiNora OS — Old 3DS system bundle
+          
+          The `MiiNora-OS-Old3DS.tar` release asset is the full manual-install system bundle for an original Nintendo 3DS (CTR). It contains the official 3DS-Linux Void root filesystem and the official SD-card boot files as supplied by the 3DS-Linux project.
+          
+          This is not a Debian build. The official 3DS-Linux project is the proven hardware base for the original 3DS; its documented support includes booting to a TTY, SD-card storage, top-screen framebuffer output, bottom-screen touch keyboard, buttons, Circle Pad, battery reporting and Wi-Fi hardware support. Audio is not supported, and the upstream project documents a shutdown kernel panic.
+          
+          The bundle is assembled from the upstream release images. It does not rebuild the Linux kernel, DTB, or FIRM loader from source. Keeping the official boot assets together avoids mixing incompatible kernel, module, rootfs, and loader versions.
+          
+          Installation remains manual. Read https://3dslinux.org/installguide/ before making changes to an SD card. Back up the card first. The documented layout uses FAT32 for boot files and EXT4 for the root filesystem. Do not format or repartition automatically. The upstream guide says the unpacked rootfs is slightly over 500 MB and recommends at least 1 GB, preferably 4 GB or more, for the EXT4 partition.
+          
+          The companion `MiiNora-Installer.cia` is a separate Homebrew menu/download app. It is not the Linux installer and does not modify firmware or partitions. Wi-Fi firmware is not included because the upstream project requires it to be extracted from the user's own console.
+          MD
+          cp -a "$SOURCE_DIR/." .
+
+          test -s installer/source/main.c
+          test -s installer/Makefile
+          echo "Release tag: $RELEASE_TAG"
+          echo "Application version: $APP_VERSION"
+
+      - name: Check that the requested release tag is unused
+        if: github.event_name == 'workflow_dispatch'
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if git ls-remote --exit-code --tags origin "refs/tags/$RELEASE_TAG" >/dev/null 2>&1; then
+            echo "ERROR: tag $RELEASE_TAG already exists. Choose a new release tag." >&2
+            exit 1
+          fi
+
+      - name: Verify devkitPro environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "DEVKITPRO=${DEVKITPRO:-<unset>}"
+          echo "DEVKITARM=${DEVKITARM:-<unset>}"
+          test -n "${DEVKITPRO:-}" || { echo "ERROR: DEVKITPRO is not set"; exit 1; }
+          test -n "${DEVKITARM:-}" || { echo "ERROR: DEVKITARM is not set"; exit 1; }
+          echo "$DEVKITARM/bin" >> "$GITHUB_PATH"
+          echo "$DEVKITPRO/tools/bin" >> "$GITHUB_PATH"
+          export PATH="$DEVKITARM/bin:$DEVKITPRO/tools/bin:$PATH"
+          test -x "$DEVKITARM/bin/arm-none-eabi-gcc" || {
+            echo "ERROR: arm-none-eabi-gcc missing in $DEVKITARM/bin"
+            ls -la "$DEVKITARM/bin" || true
+            exit 1
+          }
+          test -x "$DEVKITARM/bin/arm-none-eabi-strip" || {
+            echo "ERROR: arm-none-eabi-strip missing in $DEVKITARM/bin"
+            ls -la "$DEVKITARM/bin" || true
+            exit 1
+          }
+          test -f "$DEVKITARM/3ds_rules" || {
+            echo "ERROR: 3ds_rules missing at $DEVKITARM/3ds_rules"
+            find "$DEVKITPRO" -maxdepth 4 -name 3ds_rules -print || true
+            exit 1
+          }
+          test -f "$DEVKITPRO/libctru/include/3ds.h" || {
+            echo "ERROR: libctru header missing at $DEVKITPRO/libctru/include/3ds.h"
+            find "$DEVKITPRO" -maxdepth 5 -name 3ds.h -print || true
+            exit 1
+          }
+          command -v arm-none-eabi-gcc
+          command -v arm-none-eabi-strip
+          arm-none-eabi-gcc --version
+
+      - name: Download pinned CIA packaging tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/3ds-tools"
+          cd "$RUNNER_TEMP/3ds-tools"
+          curl --fail --location --retry 3 --retry-all-errors \
+            --user-agent 'MiiNora-CI/1.0' \
+            -o makerom.zip \
+            https://github.com/3DSGuy/Project_CTR/releases/download/makerom-v0.18.4/makerom-v0.18.4-ubuntu_x86_64.zip
+          curl --fail --location --retry 3 --retry-all-errors \
+            --user-agent 'MiiNora-CI/1.0' \
+            -o bannertool.zip \
+            https://github.com/Epicpkmn11/bannertool/releases/download/v1.2.2/bannertool.zip
+          mkdir makerom bannertool
+          unzip -q makerom.zip -d makerom
+          unzip -q bannertool.zip 'linux-x86_64/bannertool' -d bannertool
+          MAKEROM_BIN="$(find makerom -type f -name makerom -print -quit)"
+          BANNER_BIN="bannertool/linux-x86_64/bannertool"
+          test -n "$MAKEROM_BIN" || {
+            echo "ERROR: Linux makerom binary not found"
+            find makerom -maxdepth 4 -type f -print
+            exit 1
+          }
+          test -s "$BANNER_BIN" || {
+            echo "ERROR: Linux bannertool binary not found at $BANNER_BIN"
+            find bannertool -maxdepth 4 -type f -print
+            exit 1
+          }
+          chmod +x "$MAKEROM_BIN" "$BANNER_BIN"
+          echo "MAKEROM=$RUNNER_TEMP/3ds-tools/$MAKEROM_BIN" >> "$GITHUB_ENV"
+          echo "BANNERTOOL=$RUNNER_TEMP/3ds-tools/$BANNER_BIN" >> "$GITHUB_ENV"
+          file "$MAKEROM_BIN" "$BANNER_BIN"
+
+      - name: Generate artwork
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/generate-assets.py
+          test -s installer/assets/icon.png
+          test -s installer/assets/banner.png
+          test -s installer/assets/banner.wav
+
+      - name: Build native 3DS companion app
+        shell: bash
+        run: |
+          set -euo pipefail
+          make -C installer clean all
+          test -s installer/MiiNora-Installer.elf
+          test -s installer/MiiNora-Installer.3dsx
+          file installer/MiiNora-Installer.elf installer/MiiNora-Installer.3dsx
+
+      - name: Package companion CIA
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          "$BANNERTOOL" makesmdh \
+            -s "MiiNora Companion" \
+            -l "MiiNora OS companion app" \
+            -p "sl4m3d" \
+            -i installer/assets/icon.png \
+            -o dist/MiiNora.smdh
+          "$BANNERTOOL" makebanner \
+            -i installer/assets/banner.png \
+            -a installer/assets/banner.wav \
+            -o dist/MiiNora.bnr
+
+          cat > dist/MiiNora.rsf <<'RSF'
+          BasicInfo:
+            Title: "MiiNora OS"
+            CompanyCode: "00"
+            ProductCode: "CTR-P-MNRA"
+            ContentType: Application
+            Logo: Nintendo
+
+          TitleInfo:
+            UniqueId: 0xF00A0
+            Category: Application
+
+          Option:
+            UseOnSD: true
+            EnableCompress: true
+            FreeProductCode: true
+            EnableCrypt: false
+
+          SystemControlInfo:
+            SaveDataSize: 1M
+            RemasterVersion: 0000
+            StackSize: 0x00004000
+          RSF
+
+          arm-none-eabi-strip installer/MiiNora-Installer.elf
+          "$MAKEROM" -f cia \
+            -o dist/MiiNora-Installer.cia \
+            -rsf dist/MiiNora.rsf \
+            -target t -exefslogo \
+            -elf installer/MiiNora-Installer.elf \
+            -icon dist/MiiNora.smdh \
+            -banner dist/MiiNora.bnr \
+            -desc app:4
+
+          cp installer/MiiNora-Installer.3dsx dist/
+          cp README.md VERSION dist/
+          (cd "$RUNNER_TEMP/miinora-source/miinoraOS" && \
+            zip -qr "$GITHUB_WORKSPACE/dist/MiiNora-Source.zip" . \
+            -x '.github/*' '*/__pycache__/*' '*.pyc')
+
+      - name: Assemble and verify the full Old 3DS Linux system bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          WORK_DIR="$RUNNER_TEMP/miinora-upstream-system"
+          PACKAGE_DIR="dist/MiiNora-OS-Old3DS"
+          ROOTFS_URL="https://3dslinux.org/files/rootfs.tar.gz"
+          SD_FILES_URL="https://3dslinux.org/files/sd_files.tar.gz"
+          mkdir -p "$WORK_DIR" "$PACKAGE_DIR"
+
+          curl --fail --location --retry 4 --retry-all-errors --connect-timeout 30 --max-time 2400 \
+            --user-agent 'MiiNora-CI/1.0' "$ROOTFS_URL" -o "$WORK_DIR/rootfs.tar.gz"
+          curl --fail --location --retry 4 --retry-all-errors --connect-timeout 30 --max-time 1200 \
+            --user-agent 'MiiNora-CI/1.0' "$SD_FILES_URL" -o "$WORK_DIR/sd_files.tar.gz"
+
+          test -s "$WORK_DIR/rootfs.tar.gz"
+          test -s "$WORK_DIR/sd_files.tar.gz"
+          gzip -t "$WORK_DIR/rootfs.tar.gz"
+          gzip -t "$WORK_DIR/sd_files.tar.gz"
+          tar -tzf "$WORK_DIR/rootfs.tar.gz" > "$WORK_DIR/rootfs.list"
+          tar -tzf "$WORK_DIR/sd_files.tar.gz" > "$WORK_DIR/sd_files.list"
+
+          ROOTFS_ENTRIES="$(wc -l < "$WORK_DIR/rootfs.list" | tr -d ' ')"
+          SD_ENTRIES="$(wc -l < "$WORK_DIR/sd_files.list" | tr -d ' ')"
+          ROOTFS_BYTES="$(stat -c '%s' "$WORK_DIR/rootfs.tar.gz")"
+          SD_BYTES="$(stat -c '%s' "$WORK_DIR/sd_files.tar.gz")"
+          if (( ROOTFS_BYTES < 20 * 1024 * 1024 || ROOTFS_ENTRIES < 500 )); then
+            echo "ERROR: rootfs is too small to be a complete Linux root filesystem ($ROOTFS_BYTES bytes, $ROOTFS_ENTRIES entries)." >&2
+            exit 1
+          fi
+          if (( SD_BYTES < 1024 * 1024 || SD_ENTRIES < 5 )); then
+            echo "ERROR: SD boot archive is unexpectedly small ($SD_BYTES bytes, $SD_ENTRIES entries)." >&2
+            exit 1
+          fi
+          grep -Eiq '(^|/)etc/passwd$' "$WORK_DIR/rootfs.list" || { echo 'ERROR: rootfs missing etc/passwd' >&2; exit 1; }
+          grep -Eiq '(^|/)usr(/|$)' "$WORK_DIR/rootfs.list" || { echo 'ERROR: rootfs missing /usr' >&2; exit 1; }
+          grep -Eiq '\.firm$' "$WORK_DIR/sd_files.list" || { echo 'ERROR: SD boot files have no FIRM payload' >&2; exit 1; }
+
+          cp "$WORK_DIR/rootfs.tar.gz" "$PACKAGE_DIR/rootfs.tar.gz"
+          cp "$WORK_DIR/sd_files.tar.gz" "$PACKAGE_DIR/sd_files.tar.gz"
+          cat > "$PACKAGE_DIR/README.md" <<'MD'
+          # MiiNora OS — Old 3DS system bundle
+
+          This is the complete manual-install Linux system bundle for the original Nintendo 3DS (CTR). It contains the official 3DS-Linux Void root filesystem and the official SD-card boot files.
+
+          This is **Void Linux, not Debian**. The upstream project documents booting on the original 3DS, SD storage, top-screen framebuffer, bottom-screen virtual keyboard, buttons, Circle Pad, battery reporting and the AR6014 Wi-Fi adapter. Sound is not supported; shutdown may cause a kernel panic; Linux cannot be launched as a normal CIA after Horizon OS has taken control.
+
+          This build assembles the official upstream rootfs and matching SD boot files. It does not rebuild the upstream kernel, DTB, or FIRM loader from source. Keeping the published assets together avoids mixing incompatible kernel, modules, rootfs and loader versions.
+
+          Installation is manual. Read https://3dslinux.org/installguide/ before changing an SD card. The documented layout uses FAT32 for boot files and EXT4 for the root filesystem. The unpacked rootfs is slightly over 500 MB; upstream recommends at least 1 GB, preferably 4 GB or more, for the EXT4 partition. Back up the SD card first. MiiNora does not format or repartition it.
+
+          The companion `MiiNora-Installer.cia` is a separate Homebrew menu/download app. It does not install Linux or modify firmware. Console-specific Wi-Fi firmware is not included; the upstream guide explains why it must come from the user's own console.
+          MD
+          cat > "$PACKAGE_DIR/UPSTREAM-SOURCES.txt" <<SOURCES
+          Official 3DS-Linux assets used by this build:
+            Root filesystem: $ROOTFS_URL
+            SD-card boot files: $SD_FILES_URL
+            Downloads: https://3dslinux.org/downloads/
+            Install guide: https://3dslinux.org/installguide/
+
+          Related upstream source repositories (not rebuilt in this packaging job):
+            Kernel: https://github.com/Peugeot205GTI/linux-3DS
+            Kernel commit: bea91bcc5b67151eb439b31a73f53083dcd72c2b
+            FIRM Linux Loader: https://github.com/Peugeot205GTI/firm_linux_loader
+            Loader commit: e5046868faf125bd1580ca1f24b63b823c5dd9ed
+            ARM9 firmware: https://github.com/Peugeot205GTI/arm9linuxfw
+            ARM9 firmware commit: 95474297b6df406889bdf6cde02cba1024cb3ce3
+
+          Upstream files retain their original licenses and attribution. No console-specific Wi-Fi firmware is included.
+          SOURCES
+          cat > "$PACKAGE_DIR/BUILD-INFO.txt" <<INFO
+          MiiNora OS — Old Nintendo 3DS (CTR)
+          Build version: $MIINORA_VERSION
+          Build UTC: $(date -u +'%Y-%m-%dT%H:%M:%SZ')
+          Rootfs archive bytes: $ROOTFS_BYTES
+          Rootfs archive entries: $ROOTFS_ENTRIES
+          SD boot archive bytes: $SD_BYTES
+          SD boot archive entries: $SD_ENTRIES
+          Base distribution: Void Linux (official 3DS-Linux rootfs)
+          INFO
+          (cd "$PACKAGE_DIR" && sha256sum rootfs.tar.gz sd_files.tar.gz README.md UPSTREAM-SOURCES.txt BUILD-INFO.txt > SHA256SUMS)
+          tar --format=gnu -cf dist/MiiNora-OS-Old3DS.tar -C dist MiiNora-OS-Old3DS
+          tar -tf dist/MiiNora-OS-Old3DS.tar > "$WORK_DIR/bundle.list"
+          grep -q 'MiiNora-OS-Old3DS/rootfs.tar.gz' "$WORK_DIR/bundle.list"
+          grep -q 'MiiNora-OS-Old3DS/sd_files.tar.gz' "$WORK_DIR/bundle.list"
+          cat > dist/MiiNora-OS-Old3DS-README.md <<'MD'
+          # MiiNora OS — Old 3DS
+
+          The release includes the official 3DS-Linux Void root filesystem and SD boot files. It is not Debian. Installation remains manual; read https://3dslinux.org/installguide/ and back up the SD card first. The companion CIA is not the Linux installer. Sound is not supported by upstream, and Wi-Fi firmware is not redistributed.
+          MD
+          printf 'Verified Old-3DS rootfs: %s bytes, %s entries\n' "$ROOTFS_BYTES" "$ROOTFS_ENTRIES"
+          printf 'Verified SD boot files: %s bytes, %s entries\n' "$SD_BYTES" "$SD_ENTRIES"
+          printf 'System bundle: %s bytes\n' "$(stat -c '%s' dist/MiiNora-OS-Old3DS.tar)"
+
+      - name: Verify all release outputs and create checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s dist/MiiNora-Installer.cia
+          test -s dist/MiiNora-Installer.3dsx
+          test -s dist/MiiNora-Source.zip
+          test -s dist/MiiNora-OS-Old3DS.tar
+          test -s dist/MiiNora-OS-Old3DS-README.md
+          tar -tf dist/MiiNora-OS-Old3DS.tar >/dev/null
+          (cd dist && sha256sum \
+            MiiNora-Installer.cia \
+            MiiNora-Installer.3dsx \
+            MiiNora-Source.zip \
+            MiiNora-OS-Old3DS.tar \
+            MiiNora-OS-Old3DS-README.md > SHA256SUMS)
+          file dist/MiiNora-Installer.cia dist/MiiNora-Installer.3dsx dist/MiiNora-OS-Old3DS.tar
+          ls -lh dist/
+          cat dist/SHA256SUMS
+
+      - name: Create GitHub prerelease with the requested tag
+        if: github.event_name == 'workflow_dispatch'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: "MiiNora OS ${{ steps.version.outputs.tag }}"
+          target_commitish: ${{ github.sha }}
+          prerelease: true
+          make_latest: false
+          generate_release_notes: true
+          files: |
+            dist/MiiNora-Installer.cia
+            dist/MiiNora-Installer.3dsx
+            dist/MiiNora-OS-Old3DS.tar
+            dist/MiiNora-OS-Old3DS-README.md
+            dist/MiiNora-Source.zip
+            dist/SHA256SUMS
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload complete CI build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: MiiNora-Build-${{ steps.version.outputs.tag }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
