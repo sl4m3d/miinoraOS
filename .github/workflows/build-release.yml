@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: Optional release tag (leave blank for automatic version)
+        description: Optional release tag (leave blank for v0.2.0-alpha)
         required: false
         type: string
 
@@ -21,7 +21,7 @@ jobs:
   build-os:
     name: Build Debian armel system package
     runs-on: ubuntu-24.04
-    timeout-minutes: 120
+    timeout-minutes: 90
     steps:
       - name: Check out source
         uses: actions/checkout@v4
@@ -33,9 +33,11 @@ jobs:
           ARCHIVE="$(find "$GITHUB_WORKSPACE" -maxdepth 1 -type f -iname 'MiiNora-OS-*-SOURCE.zip' -print -quit)"
           if [[ -z "$ARCHIVE" ]]; then
             echo "ERROR: MiiNora source archive not found in repository root." >&2
+            echo "Expected: MiiNora-OS-<version>-SOURCE.zip" >&2
             ls -lah "$GITHUB_WORKSPACE" >&2
             exit 1
           fi
+          echo "Using source archive: $(basename "$ARCHIVE")"
           python3 - "$ARCHIVE" "$GITHUB_WORKSPACE" "$RUNNER_TEMP/miinora-source-extract" <<'PYTHON'
           import pathlib, shutil, sys, zipfile
           archive, workspace, extract = map(pathlib.Path, sys.argv[1:])
@@ -47,35 +49,181 @@ jobs:
                   if extract.resolve() not in target.parents and target != extract.resolve():
                       raise SystemExit(f"Unsafe path in source archive: {item.filename}")
                   zf.extract(item, extract)
-                  mode = (item.external_attr >> 16) & 0o777
-                  if mode and not item.is_dir():
-                      target.chmod(mode)
+                  unix_mode = (item.external_attr >> 16) & 0o777
+                  if unix_mode and not item.is_dir():
+                      target.chmod(unix_mode)
           candidates = [p for p in extract.iterdir() if p.is_dir()]
-          source = candidates[0] if len(candidates) == 1 else extract
+          if len(candidates) == 1:
+              source = candidates[0]
+          else:
+              source = extract
           required = ["VERSION", "tests/validate-static.sh", "os/build-rootfs.sh",
                       "os/scripts/package-3ds-boot-assets.sh", "installer/Makefile",
                       "installer/source/main.c", "scripts/generate-assets.py"]
           missing = [name for name in required if not (source / name).is_file()]
           if missing:
-              raise SystemExit("Source archive is incomplete: " + ", ".join(missing))
+              raise SystemExit("Source archive is incomplete; missing: " + ", ".join(missing))
           for item in source.iterdir():
               if item.name in {".git", ".github"}:
                   continue
               dest = workspace / item.name
               if item.is_dir():
-                  shutil.copytree(item, dest, dirs_exist_ok=True)
+                  if dest.exists():
+                      shutil.copytree(item, dest, dirs_exist_ok=True)
+                  else:
+                      shutil.copytree(item, dest)
               else:
                   shutil.copy2(item, dest)
-          print(f"Restored source from {archive.name}")
+          print(f"Restored MiiNora source from {archive.name}")
           PYTHON
-          chmod +x tests/validate-static.sh os/build-rootfs.sh os/scripts/package-3ds-boot-assets.sh os/install-on-linux-host.sh
-          test -s os/build-rootfs.sh
-          test -s installer/source/main.c
+          chmod +x "$GITHUB_WORKSPACE/tests/validate-static.sh" \
+            "$GITHUB_WORKSPACE/os/build-rootfs.sh" \
+            "$GITHUB_WORKSPACE/os/scripts/package-3ds-boot-assets.sh" \
+            "$GITHUB_WORKSPACE/os/install-on-linux-host.sh"
+          test -s "$GITHUB_WORKSPACE/os/build-rootfs.sh"
+          test -s "$GITHUB_WORKSPACE/installer/source/main.c"
+
+      - name: Harden and validate official 3DS-Linux downloads
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > os/scripts/package-3ds-boot-assets.sh <<'SCRIPT'
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+          OUT="${1:-$ROOT/dist/os-package}"
+          WORK="${RUNNER_TEMP:-/tmp}/miinora-3ds-boot-assets"
+          SD_URL="https://3dslinux.org/files/sd_files.tar.gz"
+          MODULES_URL="https://3dslinux.org/files/modules.tar"
+
+          rm -rf "$WORK" "$OUT"
+          mkdir -p "$WORK/unpacked" "$WORK/modules" "$OUT/fat32" "$OUT/rootfs" "$OUT/modules"
+
+          download_official_archive() {
+            local url="$1"
+            local destination="$2"
+            local format="$3"
+            local partial="${destination}.part"
+            local listing="${destination}.listing"
+            local attempt=1
+            local max_attempts=5
+
+            while (( attempt <= max_attempts )); do
+              rm -f "$partial" "$destination" "$listing"
+              echo "Downloading official upstream asset (attempt ${attempt}/${max_attempts}): ${url}"
+
+              if curl --fail --show-error --location \
+                --connect-timeout 20 \
+                --max-time 240 \
+                --speed-limit 1024 \
+                --speed-time 30 \
+                --retry 2 \
+                --retry-all-errors \
+                --retry-delay 3 \
+                --output "$partial" \
+                "$url"; then
+                if [[ -s "$partial" ]]; then
+                  if [[ "$format" == "gzip" ]]; then
+                    tar -tzf "$partial" > "$listing" 2>/dev/null || true
+                  else
+                    tar -tf "$partial" > "$listing" 2>/dev/null || true
+                  fi
+
+                  if [[ -s "$listing" ]]; then
+                    mv "$partial" "$destination"
+                    rm -f "$listing"
+                    echo "Verified archive: $(basename "$destination") ($(stat -c '%s' "$destination") bytes)"
+                    return 0
+                  fi
+                fi
+              fi
+
+              rm -f "$partial" "$destination" "$listing"
+              if (( attempt < max_attempts )); then
+                local delay=$(( attempt * 5 ))
+                echo "Download or archive verification failed; retrying in ${delay}s." >&2
+                sleep "$delay"
+              fi
+              attempt=$((attempt + 1))
+            done
+
+            echo "ERROR: Official upstream archive could not be downloaded and verified: ${url}" >&2
+            echo "No substitute kernel, DTB, firmware, or modules will be generated." >&2
+            return 1
+          }
+
+          download_official_archive "$SD_URL" "$WORK/sd_files.tar.gz" gzip
+          download_official_archive "$MODULES_URL" "$WORK/modules.tar" tar
+
+          while IFS= read -r member; do
+            case "$member" in /*|../*|*/../*|*/..) echo "Unsafe path in upstream SD archive: $member" >&2; exit 1 ;; esac
+          done < <(tar -tzf "$WORK/sd_files.tar.gz")
+          while IFS= read -r member; do
+            case "$member" in /*|../*|*/../*|*/..) echo "Unsafe path in upstream module archive: $member" >&2; exit 1 ;; esac
+          done < <(tar -tf "$WORK/modules.tar")
+
+          tar -xzf "$WORK/sd_files.tar.gz" -C "$WORK/unpacked"
+          tar -xf "$WORK/modules.tar" -C "$WORK/modules"
+
+          MODULE_ROOT="$(find "$WORK/modules" -type d -path '*/lib/modules' -print -quit)"
+          if [[ -n "$MODULE_ROOT" ]]; then
+            mkdir -p "$OUT/modules/lib/modules"
+            cp -a "$MODULE_ROOT/." "$OUT/modules/lib/modules/"
+          else
+            MODULES_DEP="$(find "$WORK/modules" -type f -name modules.dep -print -quit)"
+            if [[ -z "$MODULES_DEP" ]]; then
+              echo 'Upstream module archive has no lib/modules tree or modules.dep file.' >&2
+              exit 1
+            fi
+            MODULE_VERSION_DIR="$(dirname "$MODULES_DEP")"
+            mkdir -p "$OUT/modules/lib/modules/$(basename "$MODULE_VERSION_DIR")"
+            cp -a "$MODULE_VERSION_DIR/." "$OUT/modules/lib/modules/$(basename "$MODULE_VERSION_DIR")/"
+          fi
+
+          tar --sort=name --owner=0 --group=0 --numeric-owner -C "$OUT/modules" -cf "$OUT/modules/3ds-modules.tar" lib/modules
+          cp -a "$WORK/unpacked/." "$OUT/fat32/"
+
+          find_one() { find "$WORK/unpacked" -type f -iname "$1" -print -quit; }
+          ZIMAGE="$(find_one zImage)"
+          DTB="$(find "$WORK/unpacked" -type f -iname '*nintendo3ds*ctr*.dtb' -print -quit)"
+          ARM9FW="$(find_one arm9linuxfw.bin)"
+          LOADER="$(find_one firm_linux_loader.firm)"
+          for name in ZIMAGE DTB ARM9FW LOADER; do
+            [[ -n "${!name}" ]] || { echo "Missing required upstream 3DS component: $name" >&2; find "$WORK/unpacked" -type f -print >&2; exit 1; }
+          done
+
+          tar -tf "$OUT/modules/3ds-modules.tar" | grep -Eq '(^|/)lib/modules/.+\.ko(\.xz|\.gz)?$' || { echo 'Upstream modules archive contains no kernel modules.' >&2; exit 1; }
+          install -D -m 0644 "$ZIMAGE" "$OUT/fat32/linux/zImage"
+          install -D -m 0644 "$DTB" "$OUT/fat32/linux/nintendo3ds_ctr.dtb"
+          install -D -m 0644 "$ARM9FW" "$OUT/fat32/linux/arm9linuxfw.bin"
+          install -D -m 0644 "$LOADER" "$OUT/fat32/luma/payloads/firm_linux_loader.firm"
+
+          cat > "$OUT/BOOT-ASSET-SOURCE.txt" <<SRC
+          3DS boot assets: $SD_URL
+          3DS kernel modules: $MODULES_URL
+          These are Nintendo 3DS-specific components, not Raspberry Pi binaries.
+          Console-specific AR6014 firmware is not redistributed. Import the user's own
+          fw-ar6014.bin into /usr/lib/firmware/ath6k/AR6014/hw1.0/fw-ar6014.bin.
+          SRC
+
+          for f in "$OUT/fat32/linux/zImage" "$OUT/fat32/linux/nintendo3ds_ctr.dtb" "$OUT/fat32/linux/arm9linuxfw.bin" "$OUT/fat32/luma/payloads/firm_linux_loader.firm" "$OUT/modules/3ds-modules.tar"; do
+            test -s "$f"
+          done
+
+          echo "Official 3DS-Linux boot assets packaged and verified successfully."
+          SCRIPT
+          chmod +x os/scripts/package-3ds-boot-assets.sh
+          bash -n os/scripts/package-3ds-boot-assets.sh
+          grep -q -- '--speed-limit 1024' os/scripts/package-3ds-boot-assets.sh
+          grep -q -- '--speed-time 30' os/scripts/package-3ds-boot-assets.sh
+          grep -q 'No substitute kernel, DTB, firmware, or modules will be generated.' os/scripts/package-3ds-boot-assets.sh
 
       - name: Reclaim GitHub runner disk space
         shell: bash
         run: |
           set -euo pipefail
+          echo "Disk space before cleanup:"
           df -h /
           sudo docker system prune -af --volumes || true
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
@@ -83,10 +231,11 @@ jobs:
             /opt/hostedtoolcache/CodeQL /usr/local/.ghcup || true
           sudo apt-get clean
           sudo rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
+          echo "Disk space after cleanup:"
           df -h /
           AVAIL_KB="$(df -Pk / | awk 'NR==2 {print $4}')"
           if (( AVAIL_KB < 6000000 )); then
-            echo "ERROR: Less than 6 GiB free before rootfs build." >&2
+            echo "ERROR: Less than 6 GiB free before Debian rootfs build." >&2
             exit 1
           fi
 
@@ -96,57 +245,12 @@ jobs:
           set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            debootstrap debian-archive-keyring qemu-user-static binfmt-support \
-            curl ca-certificates file python3 python3-pil tar gzip coreutils \
-            findutils binutils
-          test -s /usr/share/keyrings/debian-archive-keyring.gpg
+            debootstrap qemu-user-static binfmt-support curl ca-certificates \
+            file python3 python3-pil tar gzip coreutils findutils binutils
           sudo update-binfmts --enable qemu-arm || true
 
       - name: Run source static validation
-        shell: bash
         run: bash ./tests/validate-static.sh
-
-      - name: Patch rootfs packaging safely
-        shell: bash
-        run: |
-          set -euo pipefail
-          python3 - <<'PY'
-          from pathlib import Path
-          import re
-          p = Path("os/build-rootfs.sh")
-          s = p.read_text()
-          old_copy = 'cp -a "$ROOTFS/." "$OUT/package/"'
-          if old_copy not in s:
-              raise SystemExit("Expected rootfs staging copy not found; refusing unsafe automatic patch.")
-          s = s.replace(old_copy, 'mkdir -p "$OUT/package"', 1)
-          # Archive directly from the generated rootfs: avoids a second full copy.
-          # Exclude contents of virtual filesystems but retain their mount-point directories.
-          lines = s.splitlines(keepends=True)
-          start = next((i for i, line in enumerate(lines) if re.match(r"\s*tar\b", line)), None)
-          if start is None:
-              raise SystemExit("Could not find the rootfs tar command; refusing partial patch.")
-          end = start
-          while end < len(lines) and "MiiNora-Debian-Bookworm-armel-rootfs.tar.gz" not in "".join(lines[start:end + 1]):
-              end += 1
-          if end >= len(lines):
-              raise SystemExit("Could not find the rootfs archive output path; refusing partial patch.")
-          block = "".join(lines[start:end + 1])
-          if '-C "$OUT/package"' not in block:
-              raise SystemExit("Rootfs tar command does not use the expected staging directory.")
-          block = re.sub(
-              r"^([ \t]*)tar\b",
-              r"\1tar --one-file-system --numeric-owner --exclude='./proc/*' --exclude='./sys/*' --exclude='./dev/*' --exclude='./run/*'",
-              block,
-              count=1,
-              flags=re.M,
-          )
-          block = block.replace('-C "$OUT/package"', '-C "$ROOTFS"', 1)
-          lines[start:end + 1] = [block]
-          s = "".join(lines)
-          p.write_text(s)
-          print("Rootfs archive now reads directly from ROOTFS and excludes virtual filesystem contents.")
-          PY
-          bash -n os/build-rootfs.sh
 
       - name: Build minimal Debian Bookworm armel root filesystem
         shell: bash
@@ -156,43 +260,9 @@ jobs:
           sudo bash ./os/build-rootfs.sh "$RUNNER_TEMP/miinora-rootfs"
           df -h /
           du -sh "$RUNNER_TEMP/miinora-rootfs" || true
-          test -s "$RUNNER_TEMP/miinora-rootfs/MiiNora-Debian-Bookworm-armel-rootfs.tar.gz"
 
       - name: Package upstream Nintendo 3DS boot components and modules
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          # Wrap curl so every upstream request has bounded connection and
-          # transfer times plus retries. This does not replace upstream files.
-          CURL_WRAPPER="$RUNNER_TEMP/miinora-curl-wrapper"
-          mkdir -p "$CURL_WRAPPER"
-          cat > "$CURL_WRAPPER/curl" <<'CURL'
-          #!/usr/bin/env bash
-          set -euo pipefail
-          exec /usr/bin/curl \
-            --connect-timeout 20 \
-            --max-time 180 \
-            --retry 4 \
-            --retry-all-errors \
-            --retry-delay 3 \
-            --fail --location \
-            "$@"
-          CURL
-          chmod 0755 "$CURL_WRAPPER/curl"
-          export PATH="$CURL_WRAPPER:$PATH"
-
-          echo "Downloading official 3DS-Linux boot assets..."
-          if timeout --signal=TERM --kill-after=30s 20m \
-            bash ./os/scripts/package-3ds-boot-assets.sh \
-              "$RUNNER_TEMP/miinora-os-package"; then
-            echo "Official boot assets packaged."
-          else
-            status=$?
-            echo "::error::The official 3DS-Linux boot-asset download or packaging failed (exit $status)."
-            echo "::error::No substitute kernel, DTB, firmware, or modules will be generated."
-            exit "$status"
-          fi
+        run: ./os/scripts/package-3ds-boot-assets.sh "$RUNNER_TEMP/miinora-os-package"
 
       - name: Assemble and validate OS release package
         shell: bash
@@ -213,7 +283,7 @@ jobs:
             "kernel_modules": "Matching upstream 3DS-Linux modules archive",
             "bootloader": "FIRM Linux Loader for Luma3DS",
             "root_filesystem": "ext4",
-            "installer_note": "The CIA downloads the package to FAT32; install the rootfs to the prepared ext4 partition with os/install-on-linux-host.sh."
+            "installer_note": "The CIA can download the package to FAT32; extract the rootfs to the prepared ext4 partition with os/install-on-linux-host.sh."
           }
           JSON
           test -s "$PACKAGE/fat32/linux/zImage"
@@ -271,8 +341,11 @@ jobs:
           ARCHIVE="$(find "$GITHUB_WORKSPACE" -maxdepth 1 -type f -iname 'MiiNora-OS-*-SOURCE.zip' -print -quit)"
           if [[ -z "$ARCHIVE" ]]; then
             echo "ERROR: MiiNora source archive not found in repository root." >&2
+            echo "Expected: MiiNora-OS-<version>-SOURCE.zip" >&2
+            ls -lah "$GITHUB_WORKSPACE" >&2
             exit 1
           fi
+          echo "Using source archive: $(basename "$ARCHIVE")"
           python3 - "$ARCHIVE" "$GITHUB_WORKSPACE" "$RUNNER_TEMP/miinora-source-extract" <<'PYTHON'
           import pathlib, shutil, sys, zipfile
           archive, workspace, extract = map(pathlib.Path, sys.argv[1:])
@@ -284,28 +357,39 @@ jobs:
                   if extract.resolve() not in target.parents and target != extract.resolve():
                       raise SystemExit(f"Unsafe path in source archive: {item.filename}")
                   zf.extract(item, extract)
-                  mode = (item.external_attr >> 16) & 0o777
-                  if mode and not item.is_dir():
-                      target.chmod(mode)
+                  unix_mode = (item.external_attr >> 16) & 0o777
+                  if unix_mode and not item.is_dir():
+                      target.chmod(unix_mode)
           candidates = [p for p in extract.iterdir() if p.is_dir()]
-          source = candidates[0] if len(candidates) == 1 else extract
+          if len(candidates) == 1:
+              source = candidates[0]
+          else:
+              source = extract
           required = ["VERSION", "tests/validate-static.sh", "os/build-rootfs.sh",
                       "os/scripts/package-3ds-boot-assets.sh", "installer/Makefile",
                       "installer/source/main.c", "scripts/generate-assets.py"]
           missing = [name for name in required if not (source / name).is_file()]
           if missing:
-              raise SystemExit("Source archive is incomplete: " + ", ".join(missing))
+              raise SystemExit("Source archive is incomplete; missing: " + ", ".join(missing))
           for item in source.iterdir():
               if item.name in {".git", ".github"}:
                   continue
               dest = workspace / item.name
               if item.is_dir():
-                  shutil.copytree(item, dest, dirs_exist_ok=True)
+                  if dest.exists():
+                      shutil.copytree(item, dest, dirs_exist_ok=True)
+                  else:
+                      shutil.copytree(item, dest)
               else:
                   shutil.copy2(item, dest)
+          print(f"Restored MiiNora source from {archive.name}")
           PYTHON
-          chmod +x tests/validate-static.sh os/build-rootfs.sh os/scripts/package-3ds-boot-assets.sh os/install-on-linux-host.sh
-          test -s installer/source/main.c
+          chmod +x "$GITHUB_WORKSPACE/tests/validate-static.sh" \
+            "$GITHUB_WORKSPACE/os/build-rootfs.sh" \
+            "$GITHUB_WORKSPACE/os/scripts/package-3ds-boot-assets.sh" \
+            "$GITHUB_WORKSPACE/os/install-on-linux-host.sh"
+          test -s "$GITHUB_WORKSPACE/os/build-rootfs.sh"
+          test -s "$GITHUB_WORKSPACE/installer/source/main.c"
 
       - name: Install Python image dependency for static validation
         shell: bash
@@ -315,7 +399,6 @@ jobs:
           apt-get install -y --no-install-recommends python3 python3-pil
 
       - name: Run source static validation
-        shell: bash
         run: bash ./tests/validate-static.sh
 
       - name: Install build utilities and verify devkitARM tools
@@ -332,7 +415,7 @@ jobs:
           STRIP="$DEVKITARM/bin/arm-none-eabi-strip"
           if [[ ! -x "$STRIP" ]]; then STRIP="$(command -v arm-none-eabi-strip || true)"; fi
           if [[ -z "$STRIP" || ! -x "$STRIP" ]]; then
-            echo "ERROR: arm-none-eabi-strip is missing." >&2
+            echo "ERROR: arm-none-eabi-strip is missing. Refusing to package an incomplete installer." >&2
             find "$DEVKITPRO" -maxdepth 5 -name 'arm-none-eabi-strip' -print || true
             exit 1
           fi
@@ -342,12 +425,10 @@ jobs:
           "$DEVKITARM/bin/arm-none-eabi-gcc" --version
           "$STRIP" --version
 
-      - name: Run source static validation again
-        shell: bash
+      - name: Run source static validation
         run: bash ./tests/validate-static.sh
 
       - name: Generate custom MiiNora branding assets
-        shell: bash
         run: python3 scripts/generate-assets.py
 
       - name: Build native installer
@@ -408,6 +489,7 @@ jobs:
           "$BANNERTOOL" makesmdh -s "MiiNora Installer" -l "MiiNora OS setup utility" -p "sl4m3d" -i installer/assets/icon.png -o dist/MiiNora.smdh
           "$BANNERTOOL" makebanner -i installer/assets/banner.png -a installer/assets/banner.wav -o dist/MiiNora.bnr
           "$ARM_STRIP" installer/MiiNora-Installer.elf
+
           cat > dist/MiiNora-Installer.rsf <<'RSF'
           BasicInfo:
             Title: "MiiNora Installer"
@@ -428,8 +510,7 @@ jobs:
           cp installer/MiiNora-Installer.3dsx dist/
           cp README.md VERSION dist/
           (cd "$GITHUB_WORKSPACE" && zip -qr "$GITHUB_WORKSPACE/dist/MiiNora-Source.zip" . \
-            -x '.git/*' 'dist/*' '*/__pycache__/*' '*.pyc' \
-               'MiiNora-OS-*-SOURCE.zip' '.github/workflows/*')
+            -x '.git/*' 'dist/*' '*/__pycache__/*' '*.pyc')
           test -s dist/MiiNora-Installer.cia
           test -s dist/MiiNora-Installer.3dsx
           test -s dist/MiiNora-Source.zip
