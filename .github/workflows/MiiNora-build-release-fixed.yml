@@ -162,7 +162,37 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          ./os/scripts/package-3ds-boot-assets.sh "$RUNNER_TEMP/miinora-os-package"
+
+          # Wrap curl so every upstream request has bounded connection and
+          # transfer times plus retries. This does not replace upstream files.
+          CURL_WRAPPER="$RUNNER_TEMP/miinora-curl-wrapper"
+          mkdir -p "$CURL_WRAPPER"
+          cat > "$CURL_WRAPPER/curl" <<'CURL'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          exec /usr/bin/curl \
+            --connect-timeout 20 \
+            --max-time 180 \
+            --retry 4 \
+            --retry-all-errors \
+            --retry-delay 3 \
+            --fail --location \
+            "$@"
+          CURL
+          chmod 0755 "$CURL_WRAPPER/curl"
+          export PATH="$CURL_WRAPPER:$PATH"
+
+          echo "Downloading official 3DS-Linux boot assets..."
+          if timeout --signal=TERM --kill-after=30s 20m \
+            bash ./os/scripts/package-3ds-boot-assets.sh \
+              "$RUNNER_TEMP/miinora-os-package"; then
+            echo "Official boot assets packaged."
+          else
+            status=$?
+            echo "::error::The official 3DS-Linux boot-asset download or packaging failed (exit $status)."
+            echo "::error::No substitute kernel, DTB, firmware, or modules will be generated."
+            exit "$status"
+          fi
 
       - name: Assemble and validate OS release package
         shell: bash
@@ -191,7 +221,7 @@ jobs:
           test -s "$PACKAGE/fat32/linux/arm9linuxfw.bin"
           test -s "$PACKAGE/fat32/luma/payloads/firm_linux_loader.firm"
           test -s "$PACKAGE/modules/3ds-modules.tar"
-          tar -tf "$PACKAGE/modules/3ds-modules.tar" | grep -Eq '^lib/modules/.+\\.ko(\\.xz|\\.gz)?$'
+          tar -tf "$PACKAGE/modules/3ds-modules.tar" | grep -Eq '^lib/modules/.+\.ko(\.xz|\.gz)?$'
           ! find "$PACKAGE/fat32" -type l -print -quit | grep -q .
           ! find "$PACKAGE/fat32" -type f -name boot.firm -print -quit | grep -q .
           test "$(stat -c %s "$PACKAGE/fat32/linux/zImage")" -gt 524288
@@ -398,7 +428,8 @@ jobs:
           cp installer/MiiNora-Installer.3dsx dist/
           cp README.md VERSION dist/
           (cd "$GITHUB_WORKSPACE" && zip -qr "$GITHUB_WORKSPACE/dist/MiiNora-Source.zip" . \
-            -x '.git/*' 'dist/*' '*/__pycache__/*' '*.pyc')
+            -x '.git/*' 'dist/*' '*/__pycache__/*' '*.pyc' \
+               'MiiNora-OS-*-SOURCE.zip' '.github/workflows/*')
           test -s dist/MiiNora-Installer.cia
           test -s dist/MiiNora-Installer.3dsx
           test -s dist/MiiNora-Source.zip
