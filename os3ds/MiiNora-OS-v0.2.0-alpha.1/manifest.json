@@ -1,0 +1,23 @@
+{
+  "name": "MiiNora OS",
+  "version": "v0.2.0-alpha.1",
+  "target": "Nintendo 3DS Old model (CTR)",
+  "package": {
+    "filename": "MiiNora-OS-Package.tar.gz",
+    "release_asset_url": "https://github.com/sl4m3d/miinoraOS/releases/download/v0.2.0-alpha.1/MiiNora-OS-Package.tar.gz",
+    "sha256": "fe4885b5db6c4c5ee3d70818e546e2e58c864d02bebc167db5f59eb554a69af9",
+    "size_bytes": 87547635
+  },
+  "installer": {
+    "cia_download_path": "SD:/os3ds/MiiNora-OS-v0.2.0-alpha.1/MiiNora-OS-Package.tar.gz",
+    "downloads_only": true,
+    "ext4_installation_requires_linux_host": true
+  },
+  "boot": {
+    "luma_payload": "luma/payloads/y_firm_linux_loader.firm",
+    "kernel": "Nintendo 3DS Linux ARM kernel",
+    "real_hardware_boot_tested": false
+  },
+  "repository_source_commit": "e5a4f70933843edcc23e7afbcf1525bab3f24474",
+  "generated_at": "2026-11-27T21:19:31.296Z"
+}
